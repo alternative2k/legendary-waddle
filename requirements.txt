@@ -1,5 +1,5 @@
 streamlit==1.38.0
 streamlit-webrtc==0.47.0
 boto3==1.35.27
-av==12.3.0
-aiortc==1.6.0
+av
+aiortc
