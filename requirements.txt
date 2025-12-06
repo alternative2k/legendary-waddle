@@ -1,5 +1,5 @@
 streamlit==1.38.0
-streamlit-webrtc==0.63.0
+streamlit-webrtc
 boto3==1.35.27
-av
+pyav
 aiortc
