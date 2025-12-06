@@ -5,7 +5,6 @@ import time
 import uuid
 from botocore.exceptions import NoCredentialsError, ClientError
 from streamlit_webrtc import webrtc_streamer, RTCConfiguration, WebRtcMode
-from aiortc.contrib.media import MediaRecorder
 
 # Streamlit secrets (set in Cloud app settings)
 try:
@@ -23,8 +22,8 @@ st.markdown("**Record video → Auto-upload to S3**")
 # Session state for recording management
 if "recording" not in st.session_state:
     st.session_state.recording = False
-if "video_bytes" not in st.session_state:
-    st.session_state.video_bytes = None
+if "recorded_video" not in st.session_state:
+    st.session_state.recorded_video = None
 if "status" not in st.session_state:
     st.session_state.status = "Ready"
 if "start_time" not in st.session_state:
@@ -40,22 +39,14 @@ def get_s3_client():
         region_name=AWS_REGION
     )
 
-# Video processor (passthrough - no processing needed)
+# Video processor (passthrough)
 def video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
+    if st.session_state.recording:
+        # Store frames during recording
+        if "frames" not in st.session_state:
+            st.session_state.frames = []
+        st.session_state.frames.append(frame)
     return frame
-
-# WebRTC configuration for Cloud (public STUN)
-rtc_config = RTCConfiguration(
-    iceServers=[{"urls": ["stun:stun.l.google.com:19302"]}]
-)
-
-# Handle recording completion
-def handle_recording_complete(webrtc_ctx):
-    if webrtc_ctx.video_recorder:
-        st.session_state.video_bytes = webrtc_ctx.video_recorder.recording_data
-        upload_to_s3(st.session_state.video_bytes)
-    st.session_state.recording = False
-    st.session_state.status = "Uploaded!"
 
 def upload_to_s3(video_bytes):
     try:
@@ -63,11 +54,7 @@ def upload_to_s3(video_bytes):
         timestamp = time.strftime("%Y%m%d-%H%M%S")
         file_key = f"recordings/webcam-{timestamp}-{uuid.uuid4().hex[:8]}.mkv"
         
-        # Progress bar
         progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        # Upload with progress
         s3.put_object(
             Bucket=S3_BUCKET,
             Key=file_key,
@@ -76,7 +63,7 @@ def upload_to_s3(video_bytes):
         )
         
         s3_url = f"https://{S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/{file_key}"
-        file_size = len(video_bytes) / (1024*1024)  # MB
+        file_size = len(video_bytes) / (1024*1024)
         progress_bar.progress(100)
         st.session_state.status = f"✅ Uploaded! ({file_size:.1f}MB)"
         st.success(f"**Video saved**: [{file_key}]({s3_url})")
@@ -89,7 +76,12 @@ def upload_to_s3(video_bytes):
     except Exception as e:
         st.error(f"❌ **Upload failed**: {str(e)}")
 
-# Main recording component - FIXED: Removed video_recorder_class
+# WebRTC configuration
+rtc_config = RTCConfiguration(
+    iceServers=[{"urls": ["stun:stun.l.google.com:19302"]}]
+)
+
+# Main recording component - MINIMAL PARAMETERS ONLY
 webrtc_ctx = webrtc_streamer(
     key="recorder",
     mode=WebRtcMode.SENDONLY,
@@ -102,7 +94,7 @@ webrtc_ctx = webrtc_streamer(
             "frameRate": {"ideal": 30, "max": 30}
         }
     },
-    on_stop=lambda ctx: handle_recording_complete(ctx)
+    # NO video_recorder_class or on_stop - using session state control
 )
 
 # Control buttons and status
@@ -110,7 +102,7 @@ col1, col2 = st.columns([3, 1])
 with col1:
     if st.session_state.status == "Recording":
         elapsed = time.time() - st.session_state.start_time
-        st.metric("⏱️", f"{int(elapsed):02d}:{int(elapsed%60):02d}")
+        st.metric("⏱️", f"{int(elapsed//60):02d}:{int(elapsed%60):02d}")
     else:
         st.metric("Status", st.session_state.status)
 
@@ -120,19 +112,43 @@ with col2:
             st.session_state.recording = True
             st.session_state.start_time = time.time()
             st.session_state.status = "Recording"
+            st.session_state.frames = []
             st.rerun()
     elif st.session_state.recording:
         if st.button("⏹️ **Stop & Upload**", use_container_width=True, type="secondary"):
-            webrtc_ctx.state.stop()
+            st.session_state.recording = False
             st.session_state.status = "Processing..."
+            
+            # Convert frames to video bytes (simplified - use av container)
+            if "frames" in st.session_state and st.session_state.frames:
+                container = av.open(io.BytesIO(), mode='w', format='matroska')
+                stream = container.add_stream('libx264', rate=30)
+                stream.width = 1280
+                stream.height = 720
+                stream.pix_fmt = 'yuv420p'
+                
+                for frame in st.session_state.frames:
+                    frame_converted = frame.reformat(width=1280, height=720)
+                    packet = stream.encode(frame_converted)
+                    if packet:
+                        container.mux(packet)
+                
+                container.close()
+                video_bytes = container.output_bytes
+                st.session_state.recorded_video = video_bytes
+                upload_to_s3(video_bytes)
+                del st.session_state.frames
+            
+            st.rerun()
 
-# Reset for next recording
-if st.button("📹 New Recording"):
-    for key in ["video_bytes", "recording", "status", "start_time"]:
-        del st.session_state[key]
+# Reset button
+if st.button("📹 **New Recording**"):
+    for key in ["recording", "recorded_video", "status", "start_time", "frames"]:
+        if key in st.session_state:
+            del st.session_state[key]
     st.rerun()
 
-# Footer info
+# Footer
 st.markdown("---")
 st.info("""
 **ℹ️ Setup**:
